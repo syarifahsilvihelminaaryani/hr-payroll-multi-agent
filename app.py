@@ -4,9 +4,12 @@ Integrated Multi-Agent HR & Payroll Simulation System
 Platform simulasi dan tata kelola SDM berbasis multi-agen.
 
 Alur end-to-end (data yang sama mengalir antar modul):
-    Data gaji  ->  Modul 1: Audit & deteksi anomali
+    Data gaji  ->  Data Readiness & Quality Check
+               ->  Modul 1: Audit & deteksi anomali (+ What-If Simulator kebijakan & anggaran)
                ->  Modul 2: Negosiasi hierarkis multi-agen (HR vs Keuangan vs Karyawan)
                ->  Modul 3: Penasihat karier (kuartil gaji + jalur kompetensi)
+               ->  Tab 4  : Ringkasan eksekutif & ekspor (.md / .txt / .csv)
+    Riwayat sesi disimpan di st.session_state (dibatasi MAX_HISTORY entri).
 
 Dataset acuan : Kaggle `prince7489/employee-salary-dataset`
 LLM engine    : Groq API (library resmi `groq`)
@@ -21,6 +24,7 @@ import io
 import json
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -53,20 +57,23 @@ except ImportError:  # pragma: no cover
 APP_TITLE = "Integrated Multi-Agent HR & Payroll Simulation System"
 DEFAULT_DATA_PATH = Path("data") / "employee_salary_dataset.csv"
 
-# Dugaan nama kolom untuk pemetaan otomatis (huruf kecil, spasi -> underscore).
-# Nama kolom persis dataset Kaggle dapat berbeda; pengguna dapat mengoreksi
-# pemetaan lewat sidebar.
+# Dugaan nama kolom untuk pemetaan otomatis. Pencocokan dilakukan setelah nama kolom
+# dinormalkan (huruf kecil, hanya huruf/angka), sehingga "Monthly Salary", "monthly_salary",
+# dan "Monthly-Salary" dianggap sama. Pengguna tetap dapat mengoreksi lewat sidebar.
 COLUMN_CANDIDATES: dict[str, list[str]] = {
-    "salary": ["monthly_salary", "salary", "gaji", "annual_salary", "ctc", "salary_inr"],
-    "department": ["department", "dept", "departemen"],
-    "position": ["job_title", "jobtitle", "position", "role", "designation", "job_role", "title"],
-    "experience": ["experience_years", "experience", "years_of_experience", "years_experience", "tenure", "masa_kerja"],
-    "education": ["education_level", "education", "pendidikan"],
+    "salary": ["monthly_salary", "salary", "gaji", "gaji_pokok", "gaji_bulanan", "annual_salary", "ctc",
+               "salary_inr", "income", "pendapatan", "upah", "compensation", "base_salary"],
+    "department": ["department", "dept", "departemen", "divisi", "division", "bagian"],
+    "position": ["job_title", "jobtitle", "position", "role", "designation", "job_role", "title", "jabatan", "posisi"],
+    "experience": ["experience_years", "experience", "years_of_experience", "years_experience", "tenure",
+                   "masa_kerja", "lama_kerja", "pengalaman"],
+    "education": ["education_level", "education", "pendidikan", "degree", "jenjang"],
     "age": ["age", "umur", "usia"],
-    "gender": ["gender", "sex", "jenis_kelamin"],
-    "city": ["city", "location", "kota"],
-    "employee_id": ["employee_id", "emp_id", "empid", "id"],
-    "performance": ["performance_score", "performance", "performance_rating", "rating"],
+    "gender": ["gender", "sex", "jenis_kelamin", "kelamin"],
+    "city": ["city", "location", "kota", "lokasi", "domisili"],
+    "employee_id": ["employee_id", "emp_id", "empid", "id", "id_karyawan", "nik", "nip", "staff_id"],
+    "performance": ["performance_score", "performance", "performance_rating", "rating", "kinerja", "kpi",
+                    "skor_kinerja"],
 }
 
 FIELD_LABELS: dict[str, str] = {
@@ -82,9 +89,32 @@ FIELD_LABELS: dict[str, str] = {
     "performance": "Skor performa",
 }
 
+# Sembilan kolom penting yang diperiksa pada Data Readiness (position = opsional tambahan).
+ESSENTIAL_FIELDS = ["salary", "department", "experience", "education", "age", "gender", "city", "employee_id", "performance"]
+NUMERIC_FIELDS = ("salary", "experience", "age", "performance")
+
 NONE_OPTION = "(tidak ada)"
 
+# Model aktif Groq. Default: openai/gpt-oss-120b.
 MODEL_OPTIONS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "(ketik manual)"]
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+# Model gpt-oss memakai token untuk "reasoning"; beri ruang tambahan agar jawaban tidak terpotong/kosong.
+REASONING_HEADROOM = 1200
+
+# Riwayat sesi dibatasi agar session_state tetap ringan.
+MAX_HISTORY = 15
+WIB = timezone(timedelta(hours=7))
+
+# Strategi alokasi pada What-If Simulator.
+STRAT_CORRECT = "Koreksi underpaid (naikkan ke median grup)"
+STRAT_MERIT = "Merit merata (semua karyawan)"
+STRAT_PERF = "Merit berbasis performa"
+STRATEGIES = [STRAT_CORRECT, STRAT_MERIT, STRAT_PERF]
+
+
+def now_str() -> str:
+    """Waktu eksekusi (WIB) untuk riwayat dan laporan."""
+    return datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
 
 
 # =============================================================================
@@ -134,25 +164,84 @@ def make_sample_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
 
 
 def read_csv_flexible(source) -> pd.DataFrame:
-    """Membaca CSV dari path atau file-upload, mencoba beberapa encoding."""
+    """Membaca CSV dari path atau file-upload, mencoba beberapa encoding dan pemisah (, ; tab)."""
     if isinstance(source, (str, Path)):
         raw = Path(source).read_bytes()
     else:
         raw = source.getvalue()
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python")
         except UnicodeDecodeError:
             continue
     raise ValueError("Tidak dapat membaca file CSV (encoding tidak dikenali).")
 
 
+def _norm(name: object) -> str:
+    """Normalisasi nama kolom: huruf kecil, hanya huruf/angka."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def parse_number(x: object) -> float:
+    """Mengubah nilai (termasuk teks seperti 'Rp 5.000.000' atau '1,250.50') menjadi float; gagal -> NaN."""
+    if x is None:
+        return np.nan
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
+    s = re.sub(r"[^0-9,.\-]", "", str(x))
+    if s in ("", "-", ".", ","):
+        return np.nan
+    if s.count(",") > 1:
+        s = s.replace(",", "")
+    if s.count(".") > 1:
+        s = s.replace(".", "")
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def parse_series(s: pd.Series) -> pd.Series:
+    """Konversi satu kolom ke numerik secara toleran."""
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    return s.map(parse_number).astype(float)
+
+
 def detect_columns(df: pd.DataFrame) -> dict[str, Optional[str]]:
-    """Menebak kolom mana yang berperan sebagai gaji, departemen, dst."""
-    normalized = {c.lower().strip().replace(" ", "_"): c for c in df.columns}
+    """Menebak kolom mana yang berperan sebagai gaji, departemen, dst.
+
+    Urutan: (1) cocok persis setelah normalisasi, (2) cocok sebagian untuk alias >= 5 karakter.
+    Satu kolom CSV tidak dipakai untuk dua peran sekaligus.
+    """
+    norm_cols: dict[str, str] = {}
+    for c in df.columns:
+        norm_cols.setdefault(_norm(c), c)
+
     mapping: dict[str, Optional[str]] = {}
+    used: set[str] = set()
     for field, candidates in COLUMN_CANDIDATES.items():
-        mapping[field] = next((normalized[c] for c in candidates if c in normalized), None)
+        found: Optional[str] = None
+        for cand in candidates:
+            n = _norm(cand)
+            if n in norm_cols and norm_cols[n] not in used:
+                found = norm_cols[n]
+                break
+        if found is None:
+            for cand in candidates:
+                n = _norm(cand)
+                if len(n) < 5:
+                    continue
+                found = next((orig for nc, orig in norm_cols.items() if n in nc and orig not in used), None)
+                if found:
+                    break
+        mapping[field] = found
+        if found:
+            used.add(found)
     return mapping
 
 
@@ -165,7 +254,7 @@ def prepare_dataframe(raw: pd.DataFrame, mapping: dict[str, Optional[str]]) -> t
             out[field] = raw[col]
 
     # Gaji wajib numerik.
-    out["salary"] = pd.to_numeric(out["salary"], errors="coerce")
+    out["salary"] = parse_series(out["salary"])
     missing_salary = int(out["salary"].isna().sum())
     if missing_salary:
         notes.append(f"{missing_salary} baris dibuang karena gaji kosong / bukan angka.")
@@ -173,12 +262,22 @@ def prepare_dataframe(raw: pd.DataFrame, mapping: dict[str, Optional[str]]) -> t
 
     for numeric_field in ("experience", "age", "performance"):
         if numeric_field in out.columns:
-            out[numeric_field] = pd.to_numeric(out[numeric_field], errors="coerce")
+            out[numeric_field] = parse_series(out[numeric_field])
 
     out = out.reset_index(drop=True)
+
+    # Kolom opsional yang kosong total dibuang agar tidak merusak analisis.
+    for col in list(out.columns):
+        if col not in ("salary", "employee_id") and out[col].isna().all():
+            out = out.drop(columns=[col])
+            notes.append(f"Kolom opsional '{FIELD_LABELS.get(col, col)}' kosong seluruhnya sehingga diabaikan.")
+
     if "employee_id" not in out.columns:
         out["employee_id"] = [f"E{i + 1:04d}" for i in range(len(out))]
         notes.append("Kolom ID karyawan tidak ada; ID dibuat otomatis.")
+    else:
+        fallback = pd.Series([f"E{i + 1:04d}" for i in range(len(out))], index=out.index)
+        out["employee_id"] = out["employee_id"].where(out["employee_id"].notna(), fallback)
     out["employee_id"] = out["employee_id"].astype(str)
 
     # Sanity check dasar kualitas data.
@@ -192,6 +291,138 @@ def prepare_dataframe(raw: pd.DataFrame, mapping: dict[str, Optional[str]]) -> t
         if len(impossible):
             notes.append(f"{len(impossible)} baris dengan pengalaman kerja tidak masuk akal terhadap usia.")
     return out, notes
+
+
+# =============================================================================
+# 1b. DATA READINESS & QUALITY CHECK
+# =============================================================================
+
+def column_status_table(raw: pd.DataFrame, mapping: dict[str, Optional[str]]) -> pd.DataFrame:
+    """Tabel status ketersediaan tiap kolom penting (ditemukan? kosong? numerik valid?)."""
+    rows = []
+    for field, label in FIELD_LABELS.items():
+        category = "Wajib" if field == "salary" else ("Penting" if field in ESSENTIAL_FIELDS else "Opsional")
+        col = mapping.get(field)
+        if not col or col not in raw.columns:
+            if field == "employee_id":
+                status = "⚠️ Akan dibuat otomatis"
+            elif category == "Opsional":
+                status = "➖ Tidak ada (opsional)"
+            else:
+                status = "❌ Tidak ditemukan"
+            rows.append({"Kolom baku": field, "Label": label, "Kategori": category, "Kolom di CSV": "-",
+                         "Tipe": "-", "Kosong (%)": np.nan, "Numerik valid (%)": np.nan, "Status": status})
+            continue
+
+        s = raw[col]
+        miss = float(s.isna().mean() * 100)
+        valid_pct = np.nan
+        if field in NUMERIC_FIELDS and s.notna().any():
+            valid_pct = float(parse_series(s).notna().sum() / s.notna().sum() * 100)
+
+        if miss >= 99.99:
+            status = "❌ Kolom kosong total"
+        elif not np.isnan(valid_pct) and valid_pct < 90:
+            status = f"⚠️ {100 - valid_pct:.0f}% nilai bukan angka"
+        elif miss > 0:
+            status = "⚠️ Sebagian kosong"
+        else:
+            status = "✅ Siap"
+        rows.append({"Kolom baku": field, "Label": label, "Kategori": category, "Kolom di CSV": col,
+                     "Tipe": str(s.dtype), "Kosong (%)": round(miss, 1),
+                     "Numerik valid (%)": round(valid_pct, 1) if not np.isnan(valid_pct) else np.nan,
+                     "Status": status})
+    return pd.DataFrame(rows)
+
+
+def readiness_score(status_df: pd.DataFrame) -> float:
+    """Skor kesiapan 0-100: gaji bernilai 40 poin, delapan kolom penting lain @7,5 poin, dikali kelengkapan."""
+    score = 0.0
+    for _, r in status_df.iterrows():
+        if r["Kolom baku"] not in ESSENTIAL_FIELDS:
+            continue
+        weight = 40.0 if r["Kolom baku"] == "salary" else 7.5
+        if r["Kolom di CSV"] == "-" or str(r["Status"]).startswith("❌"):
+            continue
+        completeness = 1.0 - (r["Kosong (%)"] or 0.0) / 100.0
+        valid = r["Numerik valid (%)"]
+        if not pd.isna(valid):
+            completeness *= valid / 100.0
+        score += weight * completeness
+    return round(score, 1)
+
+
+def render_data_readiness(
+    raw: pd.DataFrame,
+    mapping: dict[str, Optional[str]],
+    df: Optional[pd.DataFrame] = None,
+    notes: Optional[list[str]] = None,
+) -> None:
+    """Menampilkan ringkasan kesiapan & kualitas data."""
+    st.markdown("#### ✅ Data Readiness & Quality Check")
+    status_df = column_status_table(raw, mapping)
+    score = readiness_score(status_df)
+
+    num_cols = list(raw.select_dtypes(include="number").columns)
+    cat_cols = [c for c in raw.columns if c not in num_cols]
+    total_cells = max(raw.shape[0] * raw.shape[1], 1)
+    total_missing = int(raw.isna().sum().sum())
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Baris × Kolom", f"{raw.shape[0]:,} × {raw.shape[1]}")
+    c2.metric("Sel kosong", f"{total_missing:,}", delta=f"{total_missing / total_cells * 100:.1f}% dari semua sel", delta_color="off")
+    c3.metric("Numerik / Kategorikal", f"{len(num_cols)} / {len(cat_cols)}")
+    c4.metric("Baris duplikat", f"{int(raw.duplicated().sum()):,}")
+    c5.metric("Skor kesiapan", f"{score:.0f} / 100")
+
+    salary_row = status_df[status_df["Kolom baku"] == "salary"].iloc[0]
+    if str(salary_row["Status"]).startswith("❌"):
+        st.error("Kolom gaji belum tersedia / kosong. Pilih kolom gaji di sidebar > Pemetaan kolom.")
+    elif score >= 80:
+        st.success("Data siap dipakai untuk semua modul.")
+    elif score >= 50:
+        st.warning("Data dapat dipakai, tetapi sebagian fitur akan berjalan dengan informasi terbatas (lihat catatan di bawah).")
+    else:
+        st.warning("Kesiapan data rendah. Periksa pemetaan kolom dan kualitas isi kolom.")
+
+    if df is not None:
+        st.caption(f"{len(df):,} baris valid dari {len(raw):,} baris mentah setelah pembersihan.")
+
+    st.markdown("**Status ketersediaan kolom penting**")
+    st.dataframe(status_df.drop(columns=["Label"]), hide_index=True)
+
+    # Dampak kolom yang hilang terhadap fitur.
+    have = {f for f in FIELD_LABELS if mapping.get(f) and mapping[f] in raw.columns
+            and not raw[mapping[f]].isna().all()}
+    impacts = []
+    if "department" not in have and "position" not in have:
+        impacts.append("Tanpa departemen/posisi, benchmark & audit grup memakai seluruh perusahaan sebagai satu grup.")
+    if "experience" not in have:
+        impacts.append("Tanpa pengalaman, lapis audit 'tren pengalaman' dan grafik gaji-vs-pengalaman tidak aktif.")
+    if "performance" not in have:
+        impacts.append("Tanpa skor performa, strategi 'Merit berbasis performa' berjalan sebagai merit merata.")
+    if "gender" not in have:
+        impacts.append("Tanpa gender, tabel selisih gaji antar-gender tidak ditampilkan.")
+    if "age" not in have:
+        impacts.append("Tanpa usia, pemeriksaan kewajaran pengalaman terhadap usia dilewati.")
+    if "employee_id" not in have:
+        impacts.append("ID karyawan dibuat otomatis (E0001, E0002, ...).")
+    for msg in impacts:
+        st.caption(f"ℹ️ {msg}")
+    for n in notes or []:
+        st.caption(f"🧹 {n}")
+
+    with st.expander("Detail nilai kosong & tipe data per kolom"):
+        detail = pd.DataFrame(
+            {
+                "Tipe": raw.dtypes.astype(str),
+                "Jenis": ["numerik" if c in num_cols else "kategorikal" for c in raw.columns],
+                "Kosong": raw.isna().sum(),
+                "Kosong (%)": (raw.isna().mean() * 100).round(1),
+                "Nilai unik": raw.nunique(),
+            }
+        ).sort_values("Kosong", ascending=False)
+        st.dataframe(detail)
 
 
 # =============================================================================
@@ -359,6 +590,112 @@ def budget_state(df: pd.DataFrame, cap_pct: float) -> dict:
 
 
 # =============================================================================
+# 3b. WHAT-IF SIMULATOR (kebijakan & anggaran)
+# =============================================================================
+
+def simulate_scenario(df: pd.DataFrame, audit_df: pd.DataFrame, group_col: Optional[str], cfg: dict) -> dict:
+    """Simulasi penyesuaian gaji berdasarkan skenario (pool anggaran, batas individu, strategi, merit).
+
+    Langkah:
+      1. Hitung kenaikan yang "diinginkan" per karyawan menurut strategi.
+      2. Batasi per karyawan oleh `max_individual` (% gaji).
+      3. Jika total melebihi pool anggaran, semua kenaikan diskalakan proporsional.
+      4. Audit ulang pada gaji baru untuk melihat perubahan jumlah anomali.
+    """
+    d = df.copy()
+    sal = d["salary"].astype(float)
+    total_before = float(sal.sum())
+    pool = total_before * cfg["cap_pct"] / 100.0
+
+    if group_col and group_col in d.columns:
+        gmed = d.groupby(group_col)["salary"].transform("median").fillna(sal.median())
+    else:
+        gmed = pd.Series(float(sal.median()), index=d.index)
+
+    under = audit_df["is_anomaly"].reindex(d.index).fillna(False) & (sal < gmed) & (sal > 0)
+    gap = (gmed - sal).clip(lower=0)
+    cap_each = sal * cfg["max_individual"] / 100.0
+    merit_pct = float(cfg["merit_pct"])
+    strategy = cfg["strategy"]
+
+    perf_missing = False
+    if strategy == STRAT_CORRECT:
+        want = gap.where(under, 0.0)
+    elif strategy == STRAT_MERIT:
+        want = sal * merit_pct / 100.0
+    else:
+        w: object = 1.0
+        if "performance" in d.columns and d["performance"].notna().any():
+            pmean = d["performance"].mean()
+            if pd.notna(pmean) and pmean > 0:
+                w = (d["performance"] / pmean).clip(0.5, 1.5).fillna(1.0)
+            else:
+                perf_missing = True
+        else:
+            perf_missing = True
+        want = sal * merit_pct / 100.0 * w
+
+    want = pd.Series(np.minimum(np.asarray(want, dtype=float), cap_each.to_numpy()), index=d.index).clip(lower=0)
+    need = float(want.sum())
+    scale = min(1.0, pool / need) if need > 0 else 1.0
+    inc = want * scale
+
+    d["gaji_baru"] = sal + inc
+    d["kenaikan"] = inc
+    d["kenaikan_pct"] = np.where(sal > 0, inc / sal * 100, 0.0)
+
+    after_df = d.copy()
+    after_df["salary"] = d["gaji_baru"]
+    audit_after = run_audit(after_df, group_col, cfg["mz_thresh"], cfg["resid_thresh"])
+
+    total_after = float(d["gaji_baru"].sum())
+    recipients = inc > 0.5
+    detail_cols = ["employee_id"] + ([group_col] if group_col and group_col in d.columns else [])
+    detail = d[detail_cols + ["salary", "gaji_baru", "kenaikan", "kenaikan_pct"]].copy()
+    detail["anomali_sebelum"] = audit_df["is_anomaly"].reindex(d.index).fillna(False).to_numpy()
+    detail["anomali_sesudah"] = audit_after["is_anomaly"].to_numpy()
+
+    group_table = None
+    if group_col and group_col in d.columns:
+        group_table = (
+            detail.groupby(group_col)
+            .agg(
+                n=("employee_id", "count"),
+                median_sebelum=("salary", "median"),
+                median_sesudah=("gaji_baru", "median"),
+                total_sebelum=("salary", "sum"),
+                total_sesudah=("gaji_baru", "sum"),
+            )
+            .reset_index()
+        )
+        group_table["selisih_median_%"] = (group_table["median_sesudah"] / group_table["median_sebelum"] - 1) * 100
+
+    return {
+        "strategy": strategy,
+        "merit_pct": merit_pct,
+        "cap_pct": cfg["cap_pct"],
+        "max_individual": cfg["max_individual"],
+        "mz_thresh": cfg["mz_thresh"],
+        "resid_thresh": cfg["resid_thresh"],
+        "total_before": total_before,
+        "total_after": total_after,
+        "delta": total_after - total_before,
+        "delta_pct": (total_after / total_before - 1) * 100 if total_before else 0.0,
+        "pool": pool,
+        "need": need,
+        "scale": scale,
+        "pool_used_pct": (total_after - total_before) / pool * 100 if pool > 0 else 0.0,
+        "n_recipients": int(recipients.sum()),
+        "avg_raise_pct": float(d.loc[recipients, "kenaikan_pct"].mean()) if recipients.any() else 0.0,
+        "anom_before": int(audit_df["is_anomaly"].sum()),
+        "anom_after": int(audit_after["is_anomaly"].sum()),
+        "perf_missing": perf_missing,
+        "detail": detail,
+        "group_table": group_table,
+    }
+
+
+# =============================================================================
 # 4. LAPISAN INFERENSI: GROQ CLIENT + ERROR HANDLING
 # =============================================================================
 
@@ -376,17 +713,30 @@ def get_client(api_key: str):
 
 
 def llm_chat(client, model: str, system: str, user: str, temperature: float = 0.4, max_tokens: int = 500) -> str:
-    """Satu panggilan chat completion ke Groq dengan penanganan error yang rinci."""
+    """Satu panggilan chat completion ke Groq dengan penanganan error yang rinci.
+
+    Untuk model gpt-oss (reasoning), batas token dinaikkan dan reasoning_effort diset 'low'
+    agar jawaban tidak terpotong oleh token reasoning.
+    """
+    kwargs: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if "gpt-oss" in model.lower():
+        kwargs["max_tokens"] = max_tokens + REASONING_HEADROOM
+        kwargs["reasoning_effort"] = "low"
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except TypeError:
+            # Versi SDK lama tanpa parameter reasoning_effort.
+            kwargs.pop("reasoning_effort", None)
+            resp = client.chat.completions.create(**kwargs)
         return (resp.choices[0].message.content or "").strip()
     except groq.AuthenticationError as exc:
         raise LLMError("API Key ditolak Groq (tidak valid atau sudah dicabut). Periksa kembali key Anda.") from exc
@@ -601,8 +951,9 @@ CAREER_SYSTEM = (
     "Gunakan HANYA data yang diberikan dan pengetahuan umum industri; jangan menjanjikan kenaikan gaji pasti. "
     "Tulis dalam Bahasa Indonesia, format Markdown ringkas dengan bagian: "
     "**Posisi Anda Saat Ini**, **3 Kompetensi Prioritas** (beserta alasan), "
-    "**Roadmap 0-3 / 3-6 / 6-12 Bulan**, **Indikator Keberhasilan**, **Catatan Realistis**. "
-    "Maksimal sekitar 350 kata."
+    "**Roadmap 0-3 / 3-6 / 6-12 Bulan**, **Indikator Keberhasilan**, **Catatan Realistis**, "
+    "dan tutup dengan **Poin Utama** berisi tepat 3 butir bullet singkat (satu kalimat per butir). "
+    "Maksimal sekitar 380 kata."
 )
 
 
@@ -622,15 +973,85 @@ def build_career_prompt(facts: str, q: dict, currency: str, negotiation: Optiona
     )
 
 
+def extract_key_points(text: str) -> list[str]:
+    """Mengambil butir 'Poin Utama' dari jawaban penasihat karier (fallback: butir bullet pertama)."""
+    bullet = r"^\s*(?:[-*•]|\d+[.)])\s+"
+    m = re.search(r"Poin Utama[^\n]*\n(.*)", text, flags=re.IGNORECASE | re.DOTALL)
+    block = m.group(1) if m else text
+    points = [re.sub(bullet, "", ln).replace("**", "").strip() for ln in block.splitlines() if re.match(bullet, ln)]
+    points = [p for p in points if p][:4]
+    if not points:
+        lines = [ln.strip().lstrip("#").replace("**", "").strip() for ln in text.splitlines() if ln.strip()]
+        points = lines[:3]
+    return points
+
+
 # =============================================================================
-# 7. ANTARMUKA STREAMLIT
+# 7. RIWAYAT SESI
 # =============================================================================
 
 def init_session_state() -> None:
     """Menyiapkan state yang bertahan antar interaksi Streamlit."""
     st.session_state.setdefault("committed_raise", 0.0)  # total kenaikan (per bulan) yang sudah disetujui
     st.session_state.setdefault("negotiations", {})  # emp_id -> hasil negosiasi
+    st.session_state.setdefault("careers", {})  # emp_id -> rekomendasi karier
+    st.session_state.setdefault("audit_ai", None)  # ringkasan AI audit terakhir
+    st.session_state.setdefault("exec_ai", "")  # narasi eksekutif AI terakhir
+    st.session_state.setdefault("history", [])  # riwayat analisis/simulasi (maks MAX_HISTORY)
+    st.session_state.setdefault("history_counter", 0)
 
+
+def add_history(kind: str, model: str, summary: str, detail: dict) -> None:
+    """Menambah entri riwayat (terbaru di atas) dan memangkas ke MAX_HISTORY."""
+    st.session_state["history_counter"] += 1
+    st.session_state["history"].insert(
+        0,
+        {
+            "id": st.session_state["history_counter"],
+            "waktu": now_str(),
+            "jenis": kind,
+            "model": model,
+            "ringkasan": summary,
+            "detail": detail,
+        },
+    )
+    del st.session_state["history"][MAX_HISTORY:]
+
+
+def render_history() -> None:
+    """Tampilan riwayat: daftar, lihat kembali, hapus satu / semua."""
+    st.markdown("### 🕘 Riwayat Sesi")
+    hist = st.session_state["history"]
+    if not hist:
+        st.caption("Belum ada riwayat. Jalankan audit, simpan simulasi, negosiasi, atau penasihat karier.")
+        return
+    st.caption(f"Menyimpan maksimal {MAX_HISTORY} entri terbaru; hilang saat sesi browser berakhir.")
+    st.dataframe(
+        pd.DataFrame(
+            [{"#": h["id"], "Waktu": h["waktu"], "Jenis": h["jenis"], "Model": h["model"], "Ringkasan": h["ringkasan"]} for h in hist]
+        ),
+        hide_index=True,
+    )
+    labels = {h["id"]: f"#{h['id']} | {h['waktu']} | {h['jenis']}" for h in hist}
+    sel = st.selectbox("Lihat kembali entri", list(labels), format_func=lambda k: labels[k], key="history_select")
+    entry = next((h for h in hist if h["id"] == sel), None)
+    if entry:
+        with st.expander("Detail entri", expanded=True):
+            st.write(f"**{entry['jenis']}** | {entry['waktu']} | model: `{entry['model']}`")
+            st.write(entry["ringkasan"])
+            st.json(entry["detail"], expanded=False)
+    c1, c2 = st.columns(2)
+    if c1.button("🗑️ Hapus entri terpilih"):
+        st.session_state["history"] = [h for h in hist if h["id"] != sel]
+        st.rerun()
+    if c2.button("🧹 Hapus semua riwayat"):
+        st.session_state["history"] = []
+        st.rerun()
+
+
+# =============================================================================
+# 8. ANTARMUKA STREAMLIT
+# =============================================================================
 
 def sidebar_config() -> dict:
     """Membangun sidebar konfigurasi dan mengembalikan seluruh pengaturan sebagai dict."""
@@ -645,15 +1066,18 @@ def sidebar_config() -> dict:
         type="password",
         help="Key hanya disimpan di memori sesi browser Anda. Dapatkan di console.groq.com.",
     )
-    model_choice = sb.selectbox("Model", MODEL_OPTIONS, index=0)
-    model = sb.text_input("Nama model", value="llama-3.3-70b-versatile") if model_choice == "(ketik manual)" else model_choice
+    model_choice = sb.selectbox("Model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL))
+    if model_choice == "(ketik manual)":
+        model = sb.text_input("Nama model", value=DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    else:
+        model = model_choice
     temperature = sb.slider("Temperature", 0.0, 1.0, 0.4, 0.05)
 
     if sb.button("🔌 Uji koneksi API"):
         try:
             client = get_client(api_key)
-            reply = llm_chat(client, model, "Balas singkat.", "Jawab dengan kata: OK", temperature=0.0, max_tokens=10)
-            sb.success(f"Koneksi berhasil. Balasan model: {reply}")
+            reply = llm_chat(client, model, "Balas singkat.", "Jawab dengan kata: OK", temperature=0.0, max_tokens=20)
+            sb.success(f"Koneksi berhasil. Balasan model: {reply or '(kosong, tetapi koneksi OK)'}")
         except LLMError as exc:
             sb.error(str(exc))
 
@@ -678,6 +1102,34 @@ def sidebar_config() -> dict:
     mz_thresh = sb.slider("Modified z-score (outlier grup)", 2.0, 6.0, 3.5, 0.1)
     resid_thresh = sb.slider("Residu tren pengalaman (std)", 1.5, 4.0, 2.5, 0.1)
 
+    # --- What-If ---
+    sb.subheader("🎛️ Skenario What-If")
+    scenario_active = sb.checkbox(
+        "Aktifkan skenario",
+        value=False,
+        help="Jika aktif, plafon pool, batas individu, dan sensitivitas anomali di bawah MENGGANTIKAN pengaturan di atas "
+        "untuk Audit, Simulator, dan Negosiasi.",
+    )
+    sc_cap = sb.slider("Skenario: plafon pool kenaikan (%)", 0.0, 15.0, 3.0, 0.5)
+    sc_max = sb.slider("Skenario: kenaikan individu maksimum (%)", 0.0, 40.0, 12.0, 0.5)
+    sc_sens = sb.slider(
+        "Skenario: pengali ambang anomali",
+        0.5,
+        1.5,
+        1.0,
+        0.05,
+        help="Mengalikan ambang audit. <1 = lebih sensitif (lebih banyak anomali); >1 = lebih longgar.",
+    )
+    strategy = sb.selectbox("Strategi alokasi (simulator)", STRATEGIES)
+    merit_pct = sb.slider("Merit (%) untuk strategi merit", 0.0, 15.0, 3.0, 0.5)
+    sb.caption("Strategi & merit hanya dipakai Simulator What-If di Tab 1 (selalu berlaku).")
+
+    eff_cap, eff_max, eff_mz, eff_resid = cap_pct, max_individual, mz_thresh, resid_thresh
+    if scenario_active:
+        eff_cap, eff_max = sc_cap, sc_max
+        eff_mz = float(np.clip(mz_thresh * sc_sens, 1.0, 10.0))
+        eff_resid = float(np.clip(resid_thresh * sc_sens, 1.0, 6.0))
+
     return {
         "api_key": api_key,
         "model": model,
@@ -685,11 +1137,18 @@ def sidebar_config() -> dict:
         "source": source,
         "uploaded": uploaded,
         "currency": currency,
-        "cap_pct": cap_pct,
-        "max_individual": max_individual,
+        "cap_pct": eff_cap,
+        "max_individual": eff_max,
         "rounds": rounds,
-        "mz_thresh": mz_thresh,
-        "resid_thresh": resid_thresh,
+        "mz_thresh": eff_mz,
+        "resid_thresh": eff_resid,
+        "scenario_active": scenario_active,
+        "base_cap_pct": cap_pct,
+        "base_max_individual": max_individual,
+        "base_mz_thresh": mz_thresh,
+        "base_resid_thresh": resid_thresh,
+        "strategy": strategy,
+        "merit_pct": merit_pct,
     }
 
 
@@ -715,16 +1174,109 @@ def column_mapping_ui(raw: pd.DataFrame) -> dict[str, Optional[str]]:
     """Expander pemetaan kolom; default dari deteksi otomatis, dapat dikoreksi pengguna."""
     detected = detect_columns(raw)
     options = [NONE_OPTION] + list(raw.columns)
+    sig = abs(hash(tuple(map(str, raw.columns)))) % 10**8  # kunci widget berubah bila struktur CSV berubah
     mapping: dict[str, Optional[str]] = {}
     with st.sidebar.expander("🧭 Pemetaan kolom", expanded=detected["salary"] is None):
         for field, label in FIELD_LABELS.items():
             default = detected[field] if detected[field] in options else NONE_OPTION
-            choice = st.selectbox(label, options, index=options.index(default), key=f"map_{field}")
+            choice = st.selectbox(label, options, index=options.index(default), key=f"map_{sig}_{field}")
             mapping[field] = None if choice == NONE_OPTION else choice
     return mapping
 
 
-def tab_audit(df: pd.DataFrame, audit_df: pd.DataFrame, notes: list[str], group_col: Optional[str], cfg: dict) -> None:
+def tab_data(raw: pd.DataFrame, mapping: dict, df: pd.DataFrame, notes: list[str]) -> None:
+    """Tab Data: readiness check + pratinjau."""
+    st.subheader("Data")
+    render_data_readiness(raw, mapping, df, notes)
+    st.markdown("#### Pratinjau data (setelah pembersihan)")
+    st.dataframe(df.head(200), hide_index=True)
+
+
+def render_whatif(df: pd.DataFrame, audit_df: pd.DataFrame, group_col: Optional[str], cfg: dict, whatif: dict) -> None:
+    """Panel What-If: perbandingan sebelum vs sesudah simulasi."""
+    cur = cfg["currency"]
+    st.markdown("#### 🎛️ Simulator What-If: Kebijakan & Anggaran")
+    if cfg["scenario_active"]:
+        st.info(
+            f"Skenario AKTIF: pool {cfg['cap_pct']:.1f}% | batas individu {cfg['max_individual']:.1f}% | "
+            f"ambang z-grup {cfg['mz_thresh']:.2f} | ambang tren {cfg['resid_thresh']:.2f}. "
+            "Ubah di sidebar > Skenario What-If."
+        )
+    else:
+        st.caption("Skenario tidak aktif: simulator memakai pengaturan baku sidebar. Aktifkan skenario untuk menguji angka lain.")
+    st.caption(f"Strategi: **{whatif['strategy']}**" + (f" | merit {whatif['merit_pct']:.1f}%" if whatif["strategy"] != STRAT_CORRECT else ""))
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total payroll awal / bulan", fmt_money(whatif["total_before"], cur))
+    k2.metric(
+        "Proyeksi setelah penyesuaian",
+        fmt_money(whatif["total_after"], cur),
+        delta=f"+{fmt_money(whatif['delta'], cur)} ({whatif['delta_pct']:.2f}%)",
+        delta_color="off",
+    )
+    k3.metric("Pool anggaran terpakai", f"{whatif['pool_used_pct']:.1f}%", delta=f"pool {fmt_money(whatif['pool'], cur)}", delta_color="off")
+    k4.metric("Anomali sebelum → sesudah", f"{whatif['anom_before']} → {whatif['anom_after']}")
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Karyawan menerima kenaikan", f"{whatif['n_recipients']:,}")
+    r2.metric("Rata-rata kenaikan penerima", f"{whatif['avg_raise_pct']:.2f}%")
+    if cfg["scenario_active"]:
+        base_audit = run_audit(df, group_col, cfg["base_mz_thresh"], cfg["base_resid_thresh"])
+        r3.metric(
+            "Anomali: baseline → skenario",
+            f"{int(base_audit['is_anomaly'].sum())} → {int(audit_df['is_anomaly'].sum())}",
+            help="Dampak perubahan sensitivitas pada jumlah anomali (sebelum penyesuaian gaji).",
+        )
+    else:
+        r3.metric("Faktor skala anggaran", f"{whatif['scale'] * 100:.0f}%")
+
+    if whatif["scale"] < 1.0:
+        st.warning(
+            f"Kebutuhan kenaikan ({fmt_money(whatif['need'], cur)}) melebihi pool ({fmt_money(whatif['pool'], cur)}); "
+            f"semua kenaikan diskalakan ke {whatif['scale'] * 100:.0f}%."
+        )
+    if whatif["perf_missing"]:
+        st.info("Skor performa tidak tersedia/tidak valid; merit berbasis performa dijalankan sebagai merit merata.")
+    if whatif["need"] == 0:
+        st.info("Tidak ada karyawan yang memenuhi kriteria strategi ini (mis. tidak ada anomali underpaid).")
+
+    if whatif["group_table"] is not None:
+        gt = whatif["group_table"]
+        st.markdown(f"**Median gaji per {FIELD_LABELS.get(group_col, group_col)}: sebelum vs sesudah**")
+        st.dataframe(gt.round(1), hide_index=True)
+        st.bar_chart(gt.set_index(group_col)[["median_sebelum", "median_sesudah"]])
+
+    if st.button("💾 Simpan hasil simulasi ini ke riwayat"):
+        add_history(
+            "Simulasi What-If",
+            "(tanpa AI)",
+            f"{whatif['strategy']}: +{fmt_money(whatif['delta'], cur)} ({whatif['delta_pct']:.2f}%), "
+            f"anomali {whatif['anom_before']}→{whatif['anom_after']}.",
+            {
+                "strategi": whatif["strategy"],
+                "pool_%": whatif["cap_pct"],
+                "batas_individu_%": whatif["max_individual"],
+                "merit_%": whatif["merit_pct"],
+                "ambang_mz": round(whatif["mz_thresh"], 2),
+                "ambang_tren": round(whatif["resid_thresh"], 2),
+                "payroll_awal": round(whatif["total_before"]),
+                "payroll_proyeksi": round(whatif["total_after"]),
+                "penerima": whatif["n_recipients"],
+                "anomali_sebelum": whatif["anom_before"],
+                "anomali_sesudah": whatif["anom_after"],
+            },
+        )
+        st.success("Tersimpan ke riwayat sesi (lihat Tab 4).")
+
+
+def tab_audit(
+    df: pd.DataFrame,
+    audit_df: pd.DataFrame,
+    notes: list[str],
+    group_col: Optional[str],
+    cfg: dict,
+    whatif: dict,
+) -> None:
     """Tab Modul 1: laporan audit payroll."""
     cur = cfg["currency"]
     st.subheader("Modul 1 - Payroll Audit & Anomaly Detection")
@@ -770,6 +1322,10 @@ def tab_audit(df: pd.DataFrame, audit_df: pd.DataFrame, notes: list[str], group_
         st.markdown("#### Gaji vs pengalaman")
         st.scatter_chart(df, x="experience", y="salary")
 
+    st.divider()
+    render_whatif(df, audit_df, group_col, cfg, whatif)
+
+    st.divider()
     st.markdown("#### Ringkasan oleh Agen Auditor (opsional)")
     if st.button("Minta ringkasan AI"):
         try:
@@ -790,15 +1346,32 @@ def tab_audit(df: pd.DataFrame, audit_df: pd.DataFrame, notes: list[str], group_
                     temperature=cfg["temperature"],
                     max_tokens=500,
                 )
+            st.session_state["audit_ai"] = {"text": answer, "time": now_str(), "model": cfg["model"]}
+            add_history(
+                "Audit Payroll (ringkasan AI)",
+                cfg["model"],
+                f"{n_anom} anomali dari {len(df)} karyawan. " + answer[:120].replace("\n", " ") + "...",
+                {"karyawan": len(df), "anomali": n_anom, "ambang_mz": round(cfg["mz_thresh"], 2),
+                 "ambang_tren": round(cfg["resid_thresh"], 2), "ringkasan_ai": answer},
+            )
             st.markdown(answer)
         except LLMError as exc:
             st.error(str(exc))
+    elif st.session_state["audit_ai"]:
+        saved = st.session_state["audit_ai"]
+        st.caption(f"Ringkasan tersimpan | {saved['time']} | model {saved['model']}")
+        st.markdown(saved["text"])
 
 
 def tab_negotiation(df: pd.DataFrame, audit_df: pd.DataFrame, idx: int, group_col: Optional[str], cfg: dict) -> None:
     """Tab Modul 2: simulasi negosiasi multi-agen."""
     cur = cfg["currency"]
     st.subheader("Modul 2 - Hierarchical Decision-Making & Negotiation")
+    if cfg["scenario_active"]:
+        st.info(
+            f"Skenario What-If aktif: plafon pool {cfg['cap_pct']:.1f}% dan batas individu {cfg['max_individual']:.1f}% "
+            "dipakai pada negosiasi ini."
+        )
 
     row = df.loc[idx]
     emp_id = str(row["employee_id"])
@@ -830,7 +1403,26 @@ def tab_negotiation(df: pd.DataFrame, audit_df: pd.DataFrame, idx: int, group_co
             result = run_negotiation(
                 client, cfg["model"], cfg["temperature"], facts, ceiling_pct, cfg["rounds"], cur, float(row["salary"])
             )
+            result["time"] = now_str()
+            result["model"] = cfg["model"]
+            result["emp_id"] = emp_id
             st.session_state["negotiations"][emp_id] = result
+            add_history(
+                "Negosiasi Multi-Agen",
+                cfg["model"],
+                f"{emp_id}: {'konsensus' if result['status'] == 'consensus' else 'tanpa konsensus'}, "
+                f"kenaikan {result['final_pct']:.2f}% (plafon {ceiling_pct:.2f}%).",
+                {
+                    "karyawan": emp_id,
+                    "status": result["status"],
+                    "kenaikan_%": round(result["final_pct"], 2),
+                    "plafon_%": round(ceiling_pct, 2),
+                    "gaji_sebelum": round(result["salary_before"]),
+                    "gaji_sesudah": round(result["salary_after"]),
+                    "alasan": result["rationale"],
+                    "transkrip": [{"ronde": t["round"], "agen": t["name"], "teks": t["text"]} for t in result["transcript"]],
+                },
+            )
         except LLMError as exc:
             st.error(str(exc))
     elif emp_id in st.session_state["negotiations"]:
@@ -886,10 +1478,224 @@ def tab_career(df: pd.DataFrame, audit_df: pd.DataFrame, idx: int, group_col: Op
                     temperature=cfg["temperature"],
                     max_tokens=900,
                 )
+            points = extract_key_points(answer)
+            st.session_state["careers"][emp_id] = {
+                "text": answer,
+                "points": points,
+                "time": now_str(),
+                "model": cfg["model"],
+                "quartile": q["label"],
+                "gap": q["gap"],
+            }
+            add_history(
+                "Penasihat Karier",
+                cfg["model"],
+                f"{emp_id} ({q['label']}): " + "; ".join(points[:2]),
+                {"karyawan": emp_id, "kuartil": q["label"], "selisih_target": round(q["gap"]), "poin_utama": points,
+                 "rekomendasi": answer},
+            )
             st.markdown(answer)
         except LLMError as exc:
             st.error(str(exc))
+    elif emp_id in st.session_state["careers"]:
+        saved = st.session_state["careers"][emp_id]
+        st.caption(f"Rekomendasi tersimpan | {saved['time']} | model {saved['model']}")
+        st.markdown(saved["text"])
 
+
+# =============================================================================
+# 9. TAB 4: RINGKASAN EKSEKUTIF & EKSPOR
+# =============================================================================
+
+def csv_bytes(frame: pd.DataFrame) -> bytes:
+    """CSV UTF-8 dengan BOM agar terbuka rapi di Excel."""
+    return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def negotiations_frame() -> pd.DataFrame:
+    """Hasil semua negosiasi sesi ini sebagai tabel."""
+    rows = []
+    for emp_id, r in st.session_state["negotiations"].items():
+        rows.append(
+            {
+                "employee_id": emp_id,
+                "status": r["status"],
+                "plafon_%": round(r["ceiling_pct"], 2),
+                "kenaikan_disepakati_%": round(r["final_pct"], 2),
+                "gaji_sebelum": round(r["salary_before"]),
+                "gaji_sesudah": round(r["salary_after"]),
+                "kenaikan_per_bulan": round(r["monthly_increase"]),
+                "diterapkan_ke_anggaran": r["applied"],
+                "alasan": r["rationale"],
+                "waktu": r.get("time", ""),
+                "model": r.get("model", ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_report(
+    df: pd.DataFrame,
+    audit_df: pd.DataFrame,
+    notes: list[str],
+    group_col: Optional[str],
+    cfg: dict,
+    whatif: dict,
+) -> str:
+    """Menyusun laporan ringkasan eksekutif (Markdown) dari state saat ini."""
+    cur = cfg["currency"]
+    n = len(df)
+    anomalies = audit_df[audit_df["is_anomaly"]]
+    L: list[str] = [
+        "# Laporan Ringkasan Eksekutif - HR & Payroll Simulation",
+        f"_Dibuat: {now_str()} | Model AI: {cfg['model']}_",
+        "",
+    ]
+    if st.session_state["exec_ai"]:
+        L += ["## Narasi Eksekutif (AI)", st.session_state["exec_ai"], ""]
+
+    # --- 1. Audit
+    L += ["## 1. Audit Payroll"]
+    L += [
+        f"- Karyawan dianalisis: {n:,}",
+        f"- Total payroll/bulan: {fmt_money(df['salary'].sum(), cur)} | median: {fmt_money(df['salary'].median(), cur)}",
+        f"- Anomali terdeteksi: {len(anomalies)} ({len(anomalies) / max(n, 1) * 100:.1f}%) "
+        f"pada ambang z-grup {cfg['mz_thresh']:.2f} dan tren {cfg['resid_thresh']:.2f}",
+    ]
+    if group_col:
+        gaps = compute_group_gaps(df, group_col)
+        if len(gaps):
+            top, low = gaps.iloc[0], gaps.iloc[-1]
+            L.append(
+                f"- Median tertinggi per {group_col}: {top[group_col]} ({fmt_money(top['median'], cur)}); "
+                f"terendah: {low[group_col]} ({fmt_money(low['median'], cur)})"
+            )
+    gender_gap = compute_gender_gap(df)
+    if gender_gap is not None and len(gender_gap) > 1:
+        L.append("- Median gaji per gender: " + ", ".join(f"{r['gender']} {fmt_money(r['median'], cur)}" for _, r in gender_gap.iterrows())
+                 + " (deskriptif, belum mengontrol faktor lain)")
+    for nt in notes:
+        L.append(f"- Catatan data: {nt}")
+    if len(anomalies):
+        L += ["", "Anomali teratas (berdasarkan gaji):"]
+        for _, r in anomalies.sort_values("salary", ascending=False).head(5).iterrows():
+            L.append(f"  - {r['employee_id']}: {fmt_money(r['salary'], cur)} - {r['anomaly_reasons']}")
+    if st.session_state["audit_ai"]:
+        L += ["", "**Ringkasan Agen Auditor (AI):**", st.session_state["audit_ai"]["text"]]
+
+    # --- 2. What-if
+    L += ["", "## 2. Simulasi Skenario Kebijakan & Anggaran"]
+    L += [
+        f"- Skenario aktif: {'Ya' if cfg['scenario_active'] else 'Tidak (pengaturan baku sidebar)'}",
+        f"- Strategi: {whatif['strategy']}" + (f" (merit {whatif['merit_pct']:.1f}%)" if whatif["strategy"] != STRAT_CORRECT else ""),
+        f"- Pool {whatif['cap_pct']:.1f}% dari payroll | batas individu {whatif['max_individual']:.1f}%",
+        f"- Payroll awal: {fmt_money(whatif['total_before'], cur)} -> proyeksi: {fmt_money(whatif['total_after'], cur)} "
+        f"(+{fmt_money(whatif['delta'], cur)}, {whatif['delta_pct']:.2f}%)",
+        f"- Pool terpakai: {whatif['pool_used_pct']:.1f}% | penerima kenaikan: {whatif['n_recipients']:,} "
+        f"| rata-rata kenaikan penerima: {whatif['avg_raise_pct']:.2f}%",
+        f"- Anomali sebelum -> sesudah penyesuaian: {whatif['anom_before']} -> {whatif['anom_after']}",
+    ]
+    if whatif["scale"] < 1:
+        L.append(f"- Catatan: kebutuhan melebihi pool, kenaikan diskalakan ke {whatif['scale'] * 100:.0f}%.")
+
+    # --- 3. Negosiasi
+    L += ["", "## 3. Negosiasi Multi-Agen"]
+    negs = st.session_state["negotiations"]
+    if negs:
+        b = budget_state(df, cfg["cap_pct"])
+        L.append(f"- Jumlah negosiasi sesi ini: {len(negs)} | anggaran terpakai: {fmt_money(b['committed'], cur)} dari pool {fmt_money(b['pool'], cur)}")
+        for emp_id, r in negs.items():
+            stat = "konsensus" if r["status"] == "consensus" else "tanpa konsensus"
+            L.append(
+                f"- {emp_id}: {stat}, kenaikan {r['final_pct']:.2f}% "
+                f"({fmt_money(r['salary_before'], cur)} -> {fmt_money(r['salary_after'], cur)})"
+                f"{' [diterapkan]' if r['applied'] else ''}. {r['rationale']}"
+            )
+    else:
+        L.append("_Belum ada negosiasi yang dijalankan._")
+
+    # --- 4. Karier
+    L += ["", "## 4. Penasihat Karier"]
+    careers = st.session_state["careers"]
+    if careers:
+        for emp_id, c in careers.items():
+            L.append(f"- **{emp_id}** ({c['quartile']}, selisih ke target {fmt_money(c['gap'], cur)}):")
+            for p in c["points"]:
+                L.append(f"  - {p}")
+    else:
+        L.append("_Belum ada rekomendasi karier yang dibuat._")
+
+    L += ["", "---", "_Catatan: keluaran AI bersifat simulatif dan bukan nasihat hukum/keuangan. "
+          "Keputusan kompensasi nyata perlu ditinjau manusia._"]
+    return "\n".join(L)
+
+
+def tab_export(
+    df: pd.DataFrame,
+    audit_df: pd.DataFrame,
+    notes: list[str],
+    group_col: Optional[str],
+    cfg: dict,
+    whatif: dict,
+) -> None:
+    """Tab 4: ringkasan eksekutif terpadu, unduhan, dan riwayat sesi."""
+    cur = cfg["currency"]
+    st.subheader("Ringkasan Eksekutif & Ekspor")
+
+    negs = st.session_state["negotiations"]
+    careers = st.session_state["careers"]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Anomali payroll", f"{int(audit_df['is_anomaly'].sum())}")
+    k2.metric("Proyeksi tambahan payroll", fmt_money(whatif["delta"], cur), delta=f"{whatif['delta_pct']:.2f}%", delta_color="off")
+    k3.metric("Negosiasi dijalankan", f"{len(negs)}")
+    k4.metric("Rekomendasi karier", f"{len(careers)}")
+
+    if st.button("🤖 Buat narasi eksekutif dengan AI (opsional)"):
+        try:
+            client = get_client(cfg["api_key"])
+            st.session_state["exec_ai"] = ""  # agar narasi lama tidak ikut masuk prompt
+            base_report = build_report(df, audit_df, notes, group_col, cfg, whatif)
+            with st.spinner("Menyusun narasi eksekutif..."):
+                narrative = llm_chat(
+                    client,
+                    cfg["model"],
+                    "Anda konsultan HR senior. Tulis ringkasan eksekutif untuk pimpinan dalam Bahasa Indonesia, maksimal 200 kata: "
+                    "temuan kunci, dampak anggaran, keputusan negosiasi (jika ada), dan langkah lanjut. Gunakan hanya data yang diberikan.",
+                    base_report[:8000],
+                    temperature=cfg["temperature"],
+                    max_tokens=600,
+                )
+            st.session_state["exec_ai"] = narrative
+            add_history("Ringkasan Eksekutif (AI)", cfg["model"], narrative[:140].replace("\n", " ") + "...", {"narasi": narrative})
+        except LLMError as exc:
+            st.error(str(exc))
+
+    report = build_report(df, audit_df, notes, group_col, cfg, whatif)
+    st.markdown(report)
+
+    st.markdown("### ⬇️ Unduh")
+    stamp = datetime.now(WIB).strftime("%Y%m%d_%H%M")
+    d1, d2 = st.columns(2)
+    d1.download_button("📄 Laporan ringkasan (.md)", report.encode("utf-8"), f"laporan_hr_payroll_{stamp}.md", "text/markdown")
+    d2.download_button("📄 Laporan ringkasan (.txt)", report.encode("utf-8"), f"laporan_hr_payroll_{stamp}.txt", "text/plain")
+
+    d3, d4, d5 = st.columns(3)
+    anomalies = audit_df[audit_df["is_anomaly"]]
+    cols = [c for c in ("employee_id", "position", "department", "experience", "salary", "anomaly_reasons") if c in anomalies.columns]
+    d3.download_button("📊 Data anomali (.csv)", csv_bytes(anomalies[cols]), f"anomali_payroll_{stamp}.csv", "text/csv")
+    d4.download_button("📊 Hasil simulasi what-if (.csv)", csv_bytes(whatif["detail"]), f"simulasi_whatif_{stamp}.csv", "text/csv")
+    if negs:
+        d5.download_button("📊 Hasil negosiasi (.csv)", csv_bytes(negotiations_frame()), f"hasil_negosiasi_{stamp}.csv", "text/csv")
+    else:
+        d5.caption("CSV negosiasi tersedia setelah Modul 2 dijalankan.")
+
+    st.divider()
+    render_history()
+
+
+# =============================================================================
+# 10. TITIK MASUK
+# =============================================================================
 
 def employee_selector(df: pd.DataFrame, audit_df: pd.DataFrame, cur: str) -> int:
     """Selectbox karyawan fokus yang dipakai bersama oleh Modul 2 dan 3."""
@@ -925,12 +1731,14 @@ def main() -> None:
     mapping = column_mapping_ui(raw)
     if not mapping.get("salary"):
         st.error("Kolom gaji belum dipetakan. Pilih kolom gaji di sidebar > Pemetaan kolom.")
+        render_data_readiness(raw, mapping)
         st.dataframe(raw.head(20))
         return
 
     df, notes = prepare_dataframe(raw, mapping)
     if df.empty:
-        st.error("Tidak ada baris valid setelah pembersihan data.")
+        st.error("Tidak ada baris valid setelah pembersihan data (periksa isi kolom gaji).")
+        render_data_readiness(raw, mapping)
         return
 
     # Pilihan kolom pengelompokan (posisi/departemen/dll.) untuk audit dan kuartil.
@@ -945,16 +1753,17 @@ def main() -> None:
         st.warning("Anda memakai data SINTETIS untuk demo, bukan dataset Kaggle asli.")
 
     audit_df = run_audit(df, group_col, cfg["mz_thresh"], cfg["resid_thresh"])
+    whatif = simulate_scenario(df, audit_df, group_col, cfg)
 
-    tab0, tab1, tab2, tab3 = st.tabs(["📄 Data", "1️⃣ Audit Payroll", "2️⃣ Negosiasi Multi-Agen", "3️⃣ Penasihat Karier"])
+    tab0, tab1, tab2, tab3, tab4 = st.tabs(
+        ["📄 Data", "1️⃣ Audit Payroll", "2️⃣ Negosiasi Multi-Agen", "3️⃣ Penasihat Karier", "4️⃣ Ringkasan & Ekspor"]
+    )
 
     with tab0:
-        st.subheader("Pratinjau data")
-        st.caption(f"{len(df):,} baris valid dari {len(raw):,} baris mentah.")
-        st.dataframe(df.head(200), hide_index=True)
+        tab_data(raw, mapping, df, notes)
 
     with tab1:
-        tab_audit(df, audit_df, notes, group_col, cfg)
+        tab_audit(df, audit_df, notes, group_col, cfg, whatif)
 
     with tab2:
         idx2 = employee_selector(df, audit_df, cfg["currency"])
@@ -969,6 +1778,9 @@ def main() -> None:
             key="career_employee",
         )
         tab_career(df, audit_df, idx3, group_col, cfg)
+
+    with tab4:
+        tab_export(df, audit_df, notes, group_col, cfg, whatif)
 
     st.divider()
     st.caption(
